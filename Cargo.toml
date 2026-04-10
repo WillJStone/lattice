@@ -1,0 +1,14 @@
+[package]
+name = "lattice"
+version = "0.1.0"
+edition = "2024"
+description = "LLM chat + workspace TUI with embedded terminal support and shared scratchpad"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tui-term = "0.2"
+tui-textarea = "0.7"
+portable-pty = "0.8"
+tokio = { version = "1", features = ["full"] }
+color-eyre = "0.6"
