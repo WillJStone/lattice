@@ -79,6 +79,7 @@ async fn main() -> color_eyre::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(&terminal, agent_index)?;
+    eprintln!("Scratchpad: {}", app.scratchpad_path().display());
     app.run(&mut terminal).await?;
 
     Ok(())

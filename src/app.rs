@@ -1,8 +1,9 @@
 use std::{
-    env,
+    env, fs,
     io::{BufWriter, Read, Write},
+    path::PathBuf,
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use bytes::Bytes;
@@ -29,26 +30,54 @@ pub struct AgentDef {
     pub name: &'static str,
     pub cmd: &'static str,
     pub args: &'static [&'static str],
+    /// How to inject the scratchpad prompt for this agent.
+    pub scratchpad_injection: ScratchpadInjection,
+}
+
+#[derive(Clone, Copy)]
+pub enum ScratchpadInjection {
+    /// No injection (shell, unknown agents).
+    None,
+    /// Set an environment variable with the prompt text.
+    EnvVar(&'static str),
+    /// Pass a CLI flag with the prompt text (e.g., --system-prompt).
+    CliFlag(&'static str),
 }
 
 pub const AGENTS: &[AgentDef] = &[
-    AgentDef { name: "Claude Code", cmd: "claude", args: &[] },
-    AgentDef { name: "Hermes", cmd: "hermes", args: &[] },
-    AgentDef { name: "Codex", cmd: "codex", args: &[] },
-    AgentDef { name: "Pi", cmd: "pi", args: &[] },
-    AgentDef { name: "Shell", cmd: "", args: &[] }, // uses $SHELL
+    AgentDef { name: "Claude Code", cmd: "claude", args: &[], scratchpad_injection: ScratchpadInjection::CliFlag("--system-prompt") },
+    AgentDef { name: "Hermes", cmd: "hermes", args: &[], scratchpad_injection: ScratchpadInjection::EnvVar("HERMES_EPHEMERAL_SYSTEM_PROMPT") },
+    AgentDef { name: "Codex", cmd: "codex", args: &[], scratchpad_injection: ScratchpadInjection::None },
+    AgentDef { name: "Pi", cmd: "pi", args: &[], scratchpad_injection: ScratchpadInjection::None },
+    AgentDef { name: "Shell", cmd: "", args: &[], scratchpad_injection: ScratchpadInjection::None },
 ];
 
-fn resolve_command(agent: &AgentDef) -> (String, Vec<String>) {
+fn scratchpad_prompt(path: &PathBuf) -> String {
+    format!(
+        "You are running inside Lattice, a collaborative workspace. \
+         There is a shared scratchpad file at: {}\n\
+         This scratchpad is visible to both you and the human in a side panel. \
+         You can read and edit it freely. The human can also edit it at the same time. \
+         Use it to share notes, plans, code snippets, or anything useful for collaboration.",
+        path.display()
+    )
+}
+
+fn resolve_command(agent: &AgentDef, scratchpad_path: Option<&PathBuf>) -> (String, Vec<String>) {
     if agent.cmd.is_empty() {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        (shell, vec![])
-    } else {
-        (
-            agent.cmd.to_string(),
-            agent.args.iter().map(|s| s.to_string()).collect(),
-        )
+        return (shell, vec![]);
     }
+
+    let mut args: Vec<String> = agent.args.iter().map(|s| s.to_string()).collect();
+
+    // Inject scratchpad via CLI flag if applicable.
+    if let (ScratchpadInjection::CliFlag(flag), Some(path)) = (agent.scratchpad_injection, scratchpad_path) {
+        args.push(flag.to_string());
+        args.push(scratchpad_prompt(path));
+    }
+
+    (agent.cmd.to_string(), args)
 }
 
 // ---------------------------------------------------------------------------
@@ -96,7 +125,14 @@ struct TerminalPane {
 }
 
 impl TerminalPane {
-    fn spawn(title: &str, program: &str, args: &[String], rows: u16, cols: u16) -> color_eyre::Result<Self> {
+    fn spawn(
+        title: &str,
+        program: &str,
+        args: &[String],
+        rows: u16,
+        cols: u16,
+        extra_env: Vec<(String, String)>,
+    ) -> color_eyre::Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -112,6 +148,9 @@ impl TerminalPane {
             cmd.arg(arg);
         }
         cmd.cwd(env::current_dir()?);
+        for (key, val) in &extra_env {
+            cmd.env(key, val);
+        }
 
         let killer = {
             let mut child = pair.slave.spawn_command(cmd).map_err(|e| eyre!(e))?;
@@ -168,9 +207,9 @@ impl TerminalPane {
         })
     }
 
-    fn spawn_shell(rows: u16, cols: u16) -> color_eyre::Result<Self> {
+    fn spawn_shell(rows: u16, cols: u16, scratchpad_env: Vec<(String, String)>) -> color_eyre::Result<Self> {
         let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        Self::spawn("Terminal", &shell, &[], rows, cols)
+        Self::spawn("Terminal", &shell, &[], rows, cols, scratchpad_env)
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -215,33 +254,98 @@ impl TerminalPane {
 }
 
 // ---------------------------------------------------------------------------
-// Scratchpad pane
+// Scratchpad pane (file-backed)
 // ---------------------------------------------------------------------------
 
 struct ScratchpadPane {
     textarea: TextArea<'static>,
+    file_path: PathBuf,
+    last_saved: String,
+    last_mtime: Option<SystemTime>,
+    dirty: bool,
 }
 
 impl ScratchpadPane {
-    fn new() -> Self {
-        let mut textarea = TextArea::default();
+    fn new(file_path: PathBuf) -> color_eyre::Result<Self> {
+        // Ensure parent dir exists.
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Create the file if it doesn't exist.
+        if !file_path.exists() {
+            fs::write(&file_path, "")?;
+        }
+
+        let content = fs::read_to_string(&file_path)?;
+        let mtime = fs::metadata(&file_path).ok().and_then(|m| m.modified().ok());
+
+        let lines: Vec<String> = if content.is_empty() {
+            vec![String::new()]
+        } else {
+            content.lines().map(|l| l.to_string()).collect()
+        };
+
+        let mut textarea = TextArea::new(lines);
         textarea.set_cursor_line_style(Style::default());
-        Self { textarea }
+
+        Ok(Self {
+            textarea,
+            file_path,
+            last_saved: content,
+            last_mtime: mtime,
+            dirty: false,
+        })
     }
 
-    #[allow(dead_code)]
+    fn path_display(&self) -> String {
+        self.file_path.display().to_string()
+    }
+
     fn content(&self) -> String {
         self.textarea.lines().join("\n")
     }
 
-    #[allow(dead_code)]
-    fn replace_content(&mut self, text: &str) {
-        self.textarea.select_all();
-        self.textarea.insert_str(text);
+    fn save(&mut self) {
+        let content = self.content();
+        if content != self.last_saved {
+            if fs::write(&self.file_path, &content).is_ok() {
+                self.last_saved = content;
+                self.last_mtime =
+                    fs::metadata(&self.file_path).ok().and_then(|m| m.modified().ok());
+                self.dirty = false;
+            }
+        }
+    }
+
+    /// Check if the file was modified externally and reload if so.
+    /// Only reloads when the scratchpad is NOT focused (to avoid fighting user edits).
+    fn check_external_changes(&mut self, focused: bool) {
+        if focused {
+            return;
+        }
+        let current_mtime = fs::metadata(&self.file_path).ok().and_then(|m| m.modified().ok());
+        if current_mtime != self.last_mtime {
+            if let Ok(content) = fs::read_to_string(&self.file_path) {
+                if content != self.last_saved {
+                    let lines: Vec<String> = if content.is_empty() {
+                        vec![String::new()]
+                    } else {
+                        content.lines().map(|l| l.to_string()).collect()
+                    };
+                    self.textarea = TextArea::new(lines);
+                    self.textarea.set_cursor_line_style(Style::default());
+                    self.last_saved = content;
+                    self.dirty = false;
+                }
+                self.last_mtime = current_mtime;
+            }
+        }
     }
 
     fn handle_input(&mut self, event: &Event) {
         self.textarea.input(event.clone());
+        self.dirty = true;
     }
 
     fn render(&mut self, f: &mut Frame, area: Rect, focused: bool) {
@@ -251,7 +355,8 @@ impl ScratchpadPane {
             Style::default().fg(Color::DarkGray)
         };
         let lines = self.textarea.lines().len();
-        let title = format!(" Scratchpad ({} lines) ", lines);
+        let dirty_marker = if self.dirty { " *" } else { "" };
+        let title = format!(" Scratchpad ({} lines){} — {} ", lines, dirty_marker, self.path_display());
         let block = Block::default()
             .borders(Borders::ALL)
             .title(title)
@@ -267,6 +372,10 @@ impl ScratchpadPane {
 
         f.render_widget(&self.textarea, area);
     }
+
+    fn cleanup(&self) {
+        let _ = fs::remove_file(&self.file_path);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +387,26 @@ pub struct App {
     agent_pane: TerminalPane,
     shell_pane: TerminalPane,
     scratchpad: ScratchpadPane,
+    #[allow(dead_code)]
+    session_id: String,
+}
+
+fn generate_session_id() -> String {
+    use std::time::UNIX_EPOCH;
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let pid = std::process::id();
+    format!("{ts}-{pid}")
+}
+
+fn scratchpad_path(session_id: &str) -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home)
+        .join(".lattice")
+        .join("sessions")
+        .join(format!("{session_id}-scratchpad.md"))
 }
 
 impl App {
@@ -285,7 +414,26 @@ impl App {
         let size = terminal.size()?;
 
         let agent = &AGENTS[agent_index];
-        let (program, args) = resolve_command(agent);
+
+        let session_id = generate_session_id();
+        let scratch_path = scratchpad_path(&session_id);
+        let scratchpad = ScratchpadPane::new(scratch_path)?;
+
+        // Build agent command with scratchpad injection.
+        let (program, args) = resolve_command(agent, Some(&scratchpad.file_path));
+
+        // Build env vars for the agent process.
+        let mut agent_env = vec![
+            ("LATTICE_SCRATCHPAD".to_string(), scratchpad.file_path.display().to_string()),
+        ];
+        if let ScratchpadInjection::EnvVar(var) = agent.scratchpad_injection {
+            agent_env.push((var.to_string(), scratchpad_prompt(&scratchpad.file_path)));
+        }
+
+        // Shell just gets the path env var.
+        let shell_env = vec![
+            ("LATTICE_SCRATCHPAD".to_string(), scratchpad.file_path.display().to_string()),
+        ];
 
         // Agent pane: left 50%.
         let agent_cols = (size.width * 50 / 100).saturating_sub(2);
@@ -297,15 +445,22 @@ impl App {
 
         Ok(Self {
             focus: Focus::Agent,
-            agent_pane: TerminalPane::spawn(agent.name, &program, &args, agent_rows, agent_cols)?,
-            shell_pane: TerminalPane::spawn_shell(shell_rows, shell_cols)?,
-            scratchpad: ScratchpadPane::new(),
+            agent_pane: TerminalPane::spawn(agent.name, &program, &args, agent_rows, agent_cols, agent_env)?,
+            shell_pane: TerminalPane::spawn_shell(shell_rows, shell_cols, shell_env)?,
+            scratchpad,
+            session_id,
         })
+    }
+
+    #[allow(dead_code)]
+    pub fn scratchpad_path(&self) -> &PathBuf {
+        &self.scratchpad.file_path
     }
 
     pub async fn run<B: Backend>(&mut self, terminal: &mut Terminal<B>) -> color_eyre::Result<()> {
         let mut events = EventStream::new();
         let mut tick_interval = tokio::time::interval(Duration::from_millis(50));
+        let mut save_interval = tokio::time::interval(Duration::from_millis(500));
 
         loop {
             terminal.draw(|f| self.render(f))?;
@@ -323,9 +478,20 @@ impl App {
                 _ = self.shell_pane.exit_rx.changed() => {
                     self.shell_pane.exited = true;
                 }
+                _ = save_interval.tick() => {
+                    // Auto-save dirty scratchpad and check for external changes.
+                    if self.scratchpad.dirty {
+                        self.scratchpad.save();
+                    }
+                    self.scratchpad.check_external_changes(self.focus == Focus::Scratchpad);
+                }
                 _ = tick_interval.tick() => {}
             }
         }
+
+        // Final save and cleanup.
+        self.scratchpad.save();
+        self.scratchpad.cleanup();
 
         Ok(())
     }
