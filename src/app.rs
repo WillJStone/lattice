@@ -567,7 +567,7 @@ impl App {
 
         // Right: scratchpad (top 40%) | terminal (bottom 60%).
         let [scratch_area, term_area] =
-            Layout::vertical([Constraint::Percentage(40), Constraint::Percentage(60)])
+            Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
                 .areas(right_area);
 
         // Resize PTYs if inner dimensions changed.
