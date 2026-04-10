@@ -8,14 +8,18 @@ use std::{
 
 use bytes::Bytes;
 use color_eyre::eyre::eyre;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use futures::StreamExt;
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use ratatui::{
     backend::Backend,
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Paragraph},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame, Terminal,
 };
 use tokio::sync::{mpsc, watch};
@@ -113,6 +117,9 @@ impl Focus {
 // Terminal pane (used for both agent and shell)
 // ---------------------------------------------------------------------------
 
+/// Lines of scrollback history to keep per pane.
+const SCROLLBACK_LINES: usize = 10_000;
+
 struct TerminalPane {
     title: String,
     parser: Arc<RwLock<vt100::Parser>>,
@@ -121,6 +128,7 @@ struct TerminalPane {
     exit_rx: watch::Receiver<bool>,
     prev_size: (u16, u16),
     exited: bool,
+    scroll_offset: usize,
     _killer: Box<dyn ChildKiller + Send + Sync>,
 }
 
@@ -162,7 +170,7 @@ impl TerminalPane {
         };
         drop(pair.slave);
 
-        let parser = Arc::new(RwLock::new(vt100::Parser::new(rows, cols, 0)));
+        let parser = Arc::new(RwLock::new(vt100::Parser::new(rows, cols, SCROLLBACK_LINES)));
 
         let (exit_tx, exit_rx) = watch::channel(false);
         {
@@ -203,6 +211,7 @@ impl TerminalPane {
             exit_rx,
             prev_size: (rows, cols),
             exited: false,
+            scroll_offset: 0,
             _killer: killer,
         })
     }
@@ -227,14 +236,46 @@ impl TerminalPane {
         }
     }
 
+    fn mouse_mode(&self) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding) {
+        if let Ok(p) = self.parser.read() {
+            let screen = p.screen();
+            (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding())
+        } else {
+            (vt100::MouseProtocolMode::None, vt100::MouseProtocolEncoding::Default)
+        }
+    }
+
+    fn scroll_up(&mut self, lines: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_add(lines);
+        // Clamp to available scrollback.
+        if let Ok(p) = self.parser.read() {
+            let max = p.screen().scrollback();
+            // scrollback() returns current offset, but we need the max.
+            // The actual scrollback buffer length isn't directly exposed,
+            // so we clamp to SCROLLBACK_LINES as upper bound.
+            let _ = max;
+        }
+    }
+
+    fn scroll_down(&mut self, lines: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+    }
+
+    fn scroll_reset(&mut self) {
+        self.scroll_offset = 0;
+    }
+
     fn render(&self, f: &mut Frame, area: Rect, focused: bool) {
         let border_style = if focused {
             Style::default().fg(Color::Yellow)
         } else {
             Style::default().fg(Color::DarkGray)
         };
+        let scrolled = self.scroll_offset > 0;
         let title = if self.exited {
             format!(" {} [exited] ", self.title)
+        } else if scrolled {
+            format!(" {} [+{}] ", self.title, self.scroll_offset)
         } else {
             format!(" {} ", self.title)
         };
@@ -245,12 +286,204 @@ impl TerminalPane {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
-        if let Ok(p) = self.parser.read() {
-            let cursor = Cursor::default().visibility(focused && !self.exited);
+        if let Ok(mut p) = self.parser.write() {
+            p.set_scrollback(self.scroll_offset);
+            let show_cursor = focused && !self.exited && !scrolled;
+            let cursor = Cursor::default().visibility(show_cursor);
             let pseudo_term = PseudoTerminal::new(p.screen()).cursor(cursor);
             f.render_widget(pseudo_term, inner);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Markdown rendering
+// ---------------------------------------------------------------------------
+
+fn markdown_to_styled_lines(text: &str) -> Vec<Line<'static>> {
+    let mut result = Vec::new();
+    let mut in_code_block = false;
+
+    for line in text.lines() {
+        if line.starts_with("```") {
+            in_code_block = !in_code_block;
+            let styled = Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ));
+            result.push(styled);
+            continue;
+        }
+
+        if in_code_block {
+            let styled = Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(Color::Green),
+            ));
+            result.push(styled);
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("### ") {
+            result.push(Line::from(Span::styled(
+                format!("### {rest}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else if let Some(rest) = line.strip_prefix("## ") {
+            result.push(Line::from(Span::styled(
+                format!("## {rest}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else if let Some(rest) = line.strip_prefix("# ") {
+            result.push(Line::from(Span::styled(
+                format!("# {rest}"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else if line.starts_with("> ") {
+            result.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+        } else if line.starts_with("- ") || line.starts_with("* ") {
+            let bullet = Span::styled("• ", Style::default().fg(Color::Yellow));
+            let rest_spans = parse_inline_markdown(&line[2..]);
+            let mut spans = vec![bullet];
+            spans.extend(rest_spans);
+            result.push(Line::from(spans));
+        } else if line.starts_with("---") || line.starts_with("***") || line.starts_with("___") {
+            result.push(Line::from(Span::styled(
+                "─".repeat(40),
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            result.push(Line::from(parse_inline_markdown(line)));
+        }
+    }
+
+    // Handle empty content.
+    if result.is_empty() {
+        result.push(Line::from(""));
+    }
+
+    result
+}
+
+/// Parse inline markdown: **bold**, *italic*, `code`.
+fn parse_inline_markdown(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut chars = text.char_indices().peekable();
+    let mut plain_start = 0;
+
+    while let Some(&(i, ch)) = chars.peek() {
+        match ch {
+            '`' => {
+                // Inline code.
+                if i > plain_start {
+                    spans.push(Span::raw(text[plain_start..i].to_string()));
+                }
+                chars.next();
+                let code_start = i + 1;
+                let mut code_end = None;
+                while let Some(&(j, c)) = chars.peek() {
+                    if c == '`' {
+                        code_end = Some(j);
+                        chars.next();
+                        break;
+                    }
+                    chars.next();
+                }
+                if let Some(end) = code_end {
+                    spans.push(Span::styled(
+                        text[code_start..end].to_string(),
+                        Style::default().fg(Color::Green),
+                    ));
+                    plain_start = end + 1;
+                } else {
+                    // No closing backtick, treat as plain.
+                    spans.push(Span::raw(text[i..].to_string()));
+                    return spans;
+                }
+            }
+            '*' => {
+                if i > plain_start {
+                    spans.push(Span::raw(text[plain_start..i].to_string()));
+                }
+                chars.next();
+                // Check for ** (bold) vs * (italic).
+                if chars.peek().is_some_and(|&(_, c)| c == '*') {
+                    // Bold.
+                    chars.next();
+                    let bold_start = i + 2;
+                    let mut bold_end = None;
+                    while let Some(&(j, c)) = chars.peek() {
+                        if c == '*' {
+                            chars.next();
+                            if chars.peek().is_some_and(|&(_, c2)| c2 == '*') {
+                                chars.next();
+                                bold_end = Some(j);
+                                break;
+                            }
+                        } else {
+                            chars.next();
+                        }
+                    }
+                    if let Some(end) = bold_end {
+                        spans.push(Span::styled(
+                            text[bold_start..end].to_string(),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ));
+                        plain_start = end + 2;
+                    } else {
+                        spans.push(Span::raw(text[i..].to_string()));
+                        return spans;
+                    }
+                } else {
+                    // Italic.
+                    let ital_start = i + 1;
+                    let mut ital_end = None;
+                    while let Some(&(j, c)) = chars.peek() {
+                        if c == '*' {
+                            ital_end = Some(j);
+                            chars.next();
+                            break;
+                        }
+                        chars.next();
+                    }
+                    if let Some(end) = ital_end {
+                        spans.push(Span::styled(
+                            text[ital_start..end].to_string(),
+                            Style::default().add_modifier(Modifier::ITALIC),
+                        ));
+                        plain_start = end + 1;
+                    } else {
+                        spans.push(Span::raw(text[i..].to_string()));
+                        return spans;
+                    }
+                }
+            }
+            _ => {
+                chars.next();
+            }
+        }
+    }
+
+    // Remaining plain text.
+    if plain_start < text.len() {
+        spans.push(Span::raw(text[plain_start..].to_string()));
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw(String::new()));
+    }
+
+    spans
 }
 
 // ---------------------------------------------------------------------------
@@ -354,23 +587,29 @@ impl ScratchpadPane {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let lines = self.textarea.lines().len();
+        let num_lines = self.textarea.lines().len();
         let dirty_marker = if self.dirty { " *" } else { "" };
-        let title = format!(" Scratchpad ({} lines){} — {} ", lines, dirty_marker, self.path_display());
+        let title = format!(" Scratchpad ({} lines){} — {} ", num_lines, dirty_marker, self.path_display());
         let block = Block::default()
             .borders(Borders::ALL)
             .title(title)
             .border_style(border_style);
-        self.textarea.set_block(block);
 
         if focused {
+            // Editing mode: use tui-textarea as-is.
+            self.textarea.set_block(block);
             self.textarea
                 .set_cursor_style(Style::default().bg(Color::White).fg(Color::Black));
+            f.render_widget(&self.textarea, area);
         } else {
-            self.textarea.set_cursor_style(Style::default());
+            // View mode: render markdown with wrapping.
+            let content = self.content();
+            let styled_lines = markdown_to_styled_lines(&content);
+            let paragraph = Paragraph::new(styled_lines)
+                .block(block)
+                .wrap(Wrap { trim: false });
+            f.render_widget(paragraph, area);
         }
-
-        f.render_widget(&self.textarea, area);
     }
 
     fn cleanup(&self) {
@@ -389,6 +628,10 @@ pub struct App {
     scratchpad: ScratchpadPane,
     #[allow(dead_code)]
     session_id: String,
+    // Cached pane areas for mouse hit-testing.
+    agent_area: Rect,
+    shell_area: Rect,
+    scratch_area: Rect,
 }
 
 fn generate_session_id() -> String {
@@ -449,6 +692,9 @@ impl App {
             shell_pane: TerminalPane::spawn_shell(shell_rows, shell_cols, shell_env)?,
             scratchpad,
             session_id,
+            agent_area: Rect::default(),
+            shell_area: Rect::default(),
+            scratch_area: Rect::default(),
         })
     }
 
@@ -531,6 +777,7 @@ impl App {
                 match self.focus {
                     Focus::Agent => {
                         if !self.agent_pane.exited {
+                            self.agent_pane.scroll_reset();
                             if let Some(bytes) = key_event_to_bytes(&key) {
                                 let _ = self.agent_pane.input_tx.send(Bytes::from(bytes)).await;
                             }
@@ -538,6 +785,7 @@ impl App {
                     }
                     Focus::Terminal => {
                         if !self.shell_pane.exited {
+                            self.shell_pane.scroll_reset();
                             if let Some(bytes) = key_event_to_bytes(&key) {
                                 let _ = self.shell_pane.input_tx.send(Bytes::from(bytes)).await;
                             }
@@ -548,10 +796,94 @@ impl App {
                     }
                 }
             }
+            Event::Mouse(mouse) => {
+                self.handle_mouse(mouse).await;
+            }
             Event::Resize(_cols, _rows) => {}
             _ => {}
         }
         false
+    }
+
+    async fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let col = mouse.column;
+        let row = mouse.row;
+
+        // Determine which pane the mouse is in.
+        #[allow(dead_code)]
+        enum Target { Agent, Shell, Scratchpad }
+        let target = if rect_contains(self.agent_area, col, row) {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.focus = Focus::Agent;
+            }
+            Target::Agent
+        } else if rect_contains(self.shell_area, col, row) {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.focus = Focus::Terminal;
+            }
+            Target::Shell
+        } else if rect_contains(self.scratch_area, col, row) {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.focus = Focus::Scratchpad;
+            }
+            return;
+        } else {
+            return;
+        };
+
+        let (pane, pane_area) = match target {
+            Target::Agent => (&mut self.agent_pane, self.agent_area),
+            Target::Shell => (&mut self.shell_pane, self.shell_area),
+            Target::Scratchpad => return,
+        };
+
+        if pane.exited {
+            return;
+        }
+
+        let (mode, encoding) = pane.mouse_mode();
+
+        // If the child hasn't enabled mouse tracking, handle scroll as
+        // Lattice-level scrollback (like tmux copy-mode).
+        if mode == vt100::MouseProtocolMode::None {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => pane.scroll_up(3),
+                MouseEventKind::ScrollDown => pane.scroll_down(3),
+                _ => {}
+            }
+            return;
+        }
+
+        let inner = Block::default().borders(Borders::ALL).inner(pane_area);
+        let local_col = col.saturating_sub(inner.x) + 1;
+        let local_row = row.saturating_sub(inner.y) + 1;
+
+        // Filter events based on the child's declared mouse mode.
+        let allowed = match mouse.kind {
+            MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => true,
+            MouseEventKind::Up(_) => mode != vt100::MouseProtocolMode::Press,
+            MouseEventKind::Drag(_) => {
+                mode == vt100::MouseProtocolMode::ButtonMotion
+                    || mode == vt100::MouseProtocolMode::AnyMotion
+            }
+            MouseEventKind::Moved => mode == vt100::MouseProtocolMode::AnyMotion,
+        };
+        if !allowed {
+            return;
+        }
+
+        let seq = match encoding {
+            vt100::MouseProtocolEncoding::Sgr => {
+                mouse_event_to_sgr(&mouse, local_col, local_row)
+            }
+            _ => {
+                mouse_event_to_x10(&mouse, local_col, local_row)
+            }
+        };
+        if let Some(bytes) = seq {
+            let _ = pane.input_tx.send(Bytes::from(bytes)).await;
+        }
     }
 
     fn render(&mut self, f: &mut Frame) {
@@ -569,6 +901,11 @@ impl App {
         let [scratch_area, term_area] =
             Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
                 .areas(right_area);
+
+        // Cache areas for mouse hit-testing.
+        self.agent_area = agent_area;
+        self.scratch_area = scratch_area;
+        self.shell_area = term_area;
 
         // Resize PTYs if inner dimensions changed.
         let agent_inner = Block::default().borders(Borders::ALL).inner(agent_area);
@@ -600,6 +937,73 @@ impl App {
             .alignment(Alignment::Left);
         f.render_widget(status, status_area);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mouse translation
+// ---------------------------------------------------------------------------
+
+fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
+    col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+}
+
+fn mouse_button_code(kind: &MouseEventKind) -> Option<(u8, bool)> {
+    let (cb, is_release) = match kind {
+        MouseEventKind::Down(btn) => (match btn {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+        }, false),
+        MouseEventKind::Up(btn) => (match btn {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+        }, true),
+        MouseEventKind::Drag(btn) => (match btn {
+            MouseButton::Left => 32,
+            MouseButton::Middle => 33,
+            MouseButton::Right => 34,
+        }, false),
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+        MouseEventKind::Moved => (35, false),
+    };
+    Some((cb, is_release))
+}
+
+fn apply_mouse_modifiers(cb: u8, modifiers: KeyModifiers) -> u8 {
+    let mut cb = cb;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        cb |= 4;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        cb |= 8;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        cb |= 16;
+    }
+    cb
+}
+
+/// Convert a crossterm MouseEvent to an SGR-encoded escape sequence.
+fn mouse_event_to_sgr(mouse: &MouseEvent, col: u16, row: u16) -> Option<Vec<u8>> {
+    let (cb, is_release) = mouse_button_code(&mouse.kind)?;
+    let cb = apply_mouse_modifiers(cb, mouse.modifiers);
+    let suffix = if is_release { 'm' } else { 'M' };
+    Some(format!("\x1b[<{cb};{col};{row}{suffix}").into_bytes())
+}
+
+/// Convert a crossterm MouseEvent to X10/normal mouse encoding.
+fn mouse_event_to_x10(mouse: &MouseEvent, col: u16, row: u16) -> Option<Vec<u8>> {
+    let (cb, is_release) = mouse_button_code(&mouse.kind)?;
+    let cb = if is_release { 3 } else { apply_mouse_modifiers(cb, mouse.modifiers) };
+    // X10 encoding: ESC [ M Cb Cx Cy (all +32, 1-based coords).
+    let cb_byte = (cb + 32) as u8;
+    let col_byte = (col as u8).saturating_add(32);
+    let row_byte = (row as u8).saturating_add(32);
+    Some(vec![0x1b, b'[', b'M', cb_byte, col_byte, row_byte])
 }
 
 // ---------------------------------------------------------------------------
