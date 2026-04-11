@@ -612,9 +612,6 @@ impl ScratchpadPane {
         }
     }
 
-    fn cleanup(&self) {
-        let _ = fs::remove_file(&self.file_path);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -626,30 +623,38 @@ pub struct App {
     agent_pane: TerminalPane,
     shell_pane: TerminalPane,
     scratchpad: ScratchpadPane,
-    #[allow(dead_code)]
-    session_id: String,
     // Cached pane areas for mouse hit-testing.
     agent_area: Rect,
     shell_area: Rect,
     scratch_area: Rect,
 }
 
-fn generate_session_id() -> String {
-    use std::time::UNIX_EPOCH;
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+/// Derive a stable scratchpad path from the current working directory.
+/// Uses a short hash of the canonicalized path to avoid collisions.
+fn scratchpad_path() -> color_eyre::Result<PathBuf> {
+    let cwd = env::current_dir()?;
+    let canonical = cwd.canonicalize().unwrap_or(cwd);
+    let dir_name = canonical
+        .file_name()
         .unwrap_or_default()
-        .as_millis();
-    let pid = std::process::id();
-    format!("{ts}-{pid}")
-}
+        .to_string_lossy();
 
-fn scratchpad_path(session_id: &str) -> PathBuf {
+    // Simple hash: use a few bytes from the path to disambiguate repos with the same name.
+    let hash = {
+        let path_str = canonical.to_string_lossy();
+        let mut h: u64 = 5381;
+        for b in path_str.bytes() {
+            h = h.wrapping_mul(33).wrapping_add(u64::from(b));
+        }
+        format!("{:08x}", h)
+    };
+
     let home = env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home)
+    Ok(PathBuf::from(home)
         .join(".lattice")
-        .join("sessions")
-        .join(format!("{session_id}-scratchpad.md"))
+        .join("scratchpads")
+        .join(format!("{dir_name}-{hash}"))
+        .join("scratchpad.md"))
 }
 
 impl App {
@@ -658,8 +663,7 @@ impl App {
 
         let agent = &AGENTS[agent_index];
 
-        let session_id = generate_session_id();
-        let scratch_path = scratchpad_path(&session_id);
+        let scratch_path = scratchpad_path()?;
         let scratchpad = ScratchpadPane::new(scratch_path)?;
 
         // Build agent command with scratchpad injection.
@@ -691,7 +695,6 @@ impl App {
             agent_pane: TerminalPane::spawn(agent.name, &program, &args, agent_rows, agent_cols, agent_env)?,
             shell_pane: TerminalPane::spawn_shell(shell_rows, shell_cols, shell_env)?,
             scratchpad,
-            session_id,
             agent_area: Rect::default(),
             shell_area: Rect::default(),
             scratch_area: Rect::default(),
@@ -735,9 +738,8 @@ impl App {
             }
         }
 
-        // Final save and cleanup.
+        // Final save.
         self.scratchpad.save();
-        self.scratchpad.cleanup();
 
         Ok(())
     }
