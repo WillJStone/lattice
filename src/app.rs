@@ -1,7 +1,7 @@
 use std::{
     env, fs,
     io::{BufWriter, Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::{Duration, SystemTime},
 };
@@ -90,6 +90,7 @@ fn resolve_command(agent: &AgentDef, scratchpad_path: Option<&PathBuf>) -> (Stri
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
+    Explorer,
     Agent,
     Terminal,
     Scratchpad,
@@ -98,6 +99,7 @@ enum Focus {
 impl Focus {
     fn label(self) -> &'static str {
         match self {
+            Focus::Explorer => "Explorer",
             Focus::Agent => "Agent",
             Focus::Terminal => "Terminal",
             Focus::Scratchpad => "Scratchpad",
@@ -106,11 +108,92 @@ impl Focus {
 
     fn next(self) -> Self {
         match self {
+            Focus::Explorer => Focus::Agent,
             Focus::Agent => Focus::Terminal,
             Focus::Terminal => Focus::Scratchpad,
-            Focus::Scratchpad => Focus::Agent,
+            Focus::Scratchpad => Focus::Explorer,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pane-local text selection
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SelectionAnchor {
+    /// Pane-relative row (0-based from top of inner area).
+    row: u16,
+    /// Pane-relative column.
+    col: u16,
+}
+
+struct Selection {
+    /// The pane area (inner, without border) this selection lives in.
+    pane_area: Rect,
+    start: SelectionAnchor,
+    end: SelectionAnchor,
+}
+
+impl Selection {
+    fn ordered(&self) -> (SelectionAnchor, SelectionAnchor) {
+        if (self.start.row, self.start.col) <= (self.end.row, self.end.col) {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        }
+    }
+
+    /// Check if a given pane-relative (row, col) is inside the selection.
+    fn contains(&self, row: u16, col: u16) -> bool {
+        let (s, e) = self.ordered();
+        if row < s.row || row > e.row {
+            return false;
+        }
+        if s.row == e.row {
+            col >= s.col && col <= e.col
+        } else if row == s.row {
+            col >= s.col
+        } else if row == e.row {
+            col <= e.col
+        } else {
+            true
+        }
+    }
+}
+
+/// Copy text to the system clipboard via OSC 52 escape sequence.
+fn osc52_copy(text: &str) {
+    use std::io::Write as _;
+    let encoded = base64_encode(text.as_bytes());
+    let seq = format!("\x1b]52;c;{encoded}\x07");
+    let _ = std::io::stdout().write_all(seq.as_bytes());
+    let _ = std::io::stdout().flush();
+}
+
+/// Minimal base64 encoder (no external dep needed).
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[((triple >> 18) & 0x3F) as usize] as char);
+        result.push(CHARS[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[(triple & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -265,7 +348,7 @@ impl TerminalPane {
         self.scroll_offset = 0;
     }
 
-    fn render(&self, f: &mut Frame, area: Rect, focused: bool) {
+    fn render(&self, f: &mut Frame, area: Rect, focused: bool, _selection: Option<&Selection>) {
         let border_style = if focused {
             Style::default().fg(Color::Yellow)
         } else {
@@ -615,6 +698,325 @@ impl ScratchpadPane {
 }
 
 // ---------------------------------------------------------------------------
+// File explorer (tree view)
+// ---------------------------------------------------------------------------
+
+struct FileEntry {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+    depth: usize,
+    expanded: bool,
+}
+
+struct FileExplorer {
+    entries: Vec<FileEntry>,
+    selected: usize,
+    scroll_offset: usize,
+    root: PathBuf,
+}
+
+impl FileExplorer {
+    fn new() -> color_eyre::Result<Self> {
+        let root = env::current_dir()?;
+        let mut explorer = Self {
+            entries: Vec::new(),
+            selected: 0,
+            scroll_offset: 0,
+            root,
+        };
+        explorer.refresh();
+        Ok(explorer)
+    }
+
+    fn refresh(&mut self) {
+        self.entries.clear();
+        self.collect_entries(&self.root.clone(), 0);
+    }
+
+    fn collect_entries(&mut self, dir: &Path, depth: usize) {
+        let Ok(items) = fs::read_dir(dir) else { return };
+        let mut entries: Vec<_> = items
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                // Hide dotfiles and common noise.
+                !name.starts_with('.')
+                    && name != "node_modules"
+                    && name != "target"
+                    && name != "__pycache__"
+                    && name != "venv"
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            let a_dir = a.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let b_dir = b.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            b_dir.cmp(&a_dir).then(a.file_name().cmp(&b.file_name()))
+        });
+
+        for entry in entries {
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let fe = FileEntry {
+                name: entry.file_name().to_string_lossy().to_string(),
+                path: entry.path(),
+                is_dir,
+                depth,
+                expanded: false,
+            };
+            self.entries.push(fe);
+        }
+    }
+
+    fn toggle_dir(&mut self) {
+        let Some(entry) = self.entries.get(self.selected) else { return };
+        if !entry.is_dir {
+            return;
+        }
+
+        let depth = entry.depth;
+        let path = entry.path.clone();
+
+        if entry.expanded {
+            // Collapse: remove children.
+            self.entries[self.selected].expanded = false;
+            let remove_start = self.selected + 1;
+            let mut remove_end = remove_start;
+            while remove_end < self.entries.len() && self.entries[remove_end].depth > depth {
+                remove_end += 1;
+            }
+            self.entries.drain(remove_start..remove_end);
+        } else {
+            // Expand: insert children after this entry.
+            self.entries[self.selected].expanded = true;
+            let insert_pos = self.selected + 1;
+            let child_depth = depth + 1;
+
+            let Ok(read) = fs::read_dir(&path) else { return };
+            let mut children: Vec<_> = read
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    !name.starts_with('.')
+                        && name != "node_modules"
+                        && name != "target"
+                        && name != "__pycache__"
+                        && name != "venv"
+                })
+                .collect();
+            children.sort_by(|a, b| {
+                let a_dir = a.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let b_dir = b.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                b_dir.cmp(&a_dir).then(a.file_name().cmp(&b.file_name()))
+            });
+
+            let new_entries: Vec<FileEntry> = children
+                .into_iter()
+                .map(|e| {
+                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    FileEntry {
+                        name: e.file_name().to_string_lossy().to_string(),
+                        path: e.path(),
+                        is_dir,
+                        depth: child_depth,
+                        expanded: false,
+                    }
+                })
+                .collect();
+            // Insert in reverse to maintain order at insert_pos.
+            for (i, entry) in new_entries.into_iter().enumerate() {
+                self.entries.insert(insert_pos + i, entry);
+            }
+        }
+    }
+
+    fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn move_down(&mut self) {
+        if self.selected + 1 < self.entries.len() {
+            self.selected += 1;
+        }
+    }
+
+    fn selected_path(&self) -> Option<&Path> {
+        self.entries.get(self.selected).map(|e| e.path.as_path())
+    }
+
+    fn selected_is_dir(&self) -> bool {
+        self.entries.get(self.selected).map_or(false, |e| e.is_dir)
+    }
+
+    fn render(&mut self, f: &mut Frame, area: Rect, focused: bool) {
+        let border_style = if focused {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Explorer ")
+            .border_style(border_style);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let visible_height = inner.height as usize;
+        // Adjust scroll to keep selected visible.
+        if self.selected < self.scroll_offset {
+            self.scroll_offset = self.selected;
+        } else if self.selected >= self.scroll_offset + visible_height {
+            self.scroll_offset = self.selected - visible_height + 1;
+        }
+
+        let lines: Vec<Line> = self
+            .entries
+            .iter()
+            .enumerate()
+            .skip(self.scroll_offset)
+            .take(visible_height)
+            .map(|(i, entry)| {
+                let indent = "  ".repeat(entry.depth);
+                let icon = if entry.is_dir {
+                    if entry.expanded { "v " } else { "> " }
+                } else {
+                    "  "
+                };
+                let style = if i == self.selected {
+                    if focused {
+                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                    } else {
+                        Style::default().bg(Color::DarkGray).fg(Color::Gray)
+                    }
+                } else if entry.is_dir {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                Line::from(Span::styled(format!("{indent}{icon}{}", entry.name), style))
+            })
+            .collect();
+
+        let paragraph = Paragraph::new(lines);
+        f.render_widget(paragraph, inner);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File viewer (syntax-highlighted read-only preview)
+// ---------------------------------------------------------------------------
+
+struct FileViewer {
+    path: PathBuf,
+    lines: Vec<Line<'static>>,
+    scroll_offset: usize,
+    total_lines: usize,
+}
+
+impl FileViewer {
+    fn open(path: &Path) -> Option<Self> {
+        // Don't open huge files or binary files.
+        let meta = fs::metadata(path).ok()?;
+        if meta.len() > 1_000_000 {
+            return Some(Self::error_view(path, "File too large to preview"));
+        }
+        let content = fs::read_to_string(path).ok()?;
+        let lines = Self::highlight(path, &content);
+        let total_lines = lines.len();
+        Some(Self {
+            path: path.to_path_buf(),
+            lines,
+            scroll_offset: 0,
+            total_lines,
+        })
+    }
+
+    fn error_view(path: &Path, msg: &str) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            lines: vec![Line::from(Span::styled(
+                msg.to_string(),
+                Style::default().fg(Color::Red),
+            ))],
+            scroll_offset: 0,
+            total_lines: 1,
+        }
+    }
+
+    fn highlight(path: &Path, content: &str) -> Vec<Line<'static>> {
+        use syntect::highlighting::ThemeSet;
+        use syntect::parsing::SyntaxSet;
+        use syntect::easy::HighlightLines;
+
+        let ss = SyntaxSet::load_defaults_newlines();
+        let ts = ThemeSet::load_defaults();
+        let theme = &ts.themes["base16-ocean.dark"];
+
+        let syntax = ss
+            .find_syntax_for_file(path)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| ss.find_syntax_plain_text());
+
+        let mut h = HighlightLines::new(syntax, theme);
+        let mut result = Vec::new();
+
+        for line_str in content.lines() {
+            let ranges = h.highlight_line(line_str, &ss).unwrap_or_default();
+            let spans: Vec<Span<'static>> = ranges
+                .into_iter()
+                .map(|(syn_style, text)| {
+                    let fg = syn_style.foreground;
+                    let style = Style::default().fg(Color::Rgb(fg.r, fg.g, fg.b));
+                    Span::styled(text.to_string(), style)
+                })
+                .collect();
+            result.push(Line::from(spans));
+        }
+
+        if result.is_empty() {
+            result.push(Line::from(""));
+        }
+        result
+    }
+
+    fn scroll_up(&mut self, n: usize) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(n);
+    }
+
+    fn scroll_down(&mut self, n: usize) {
+        self.scroll_offset = self
+            .scroll_offset
+            .saturating_add(n)
+            .min(self.total_lines.saturating_sub(1));
+    }
+
+    fn render(&self, f: &mut Frame, area: Rect) {
+        let file_name = self
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let title = format!(" {} (line {}) ", file_name, self.scroll_offset + 1);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(Color::Magenta));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let visible: Vec<Line> = self
+            .lines
+            .iter()
+            .skip(self.scroll_offset)
+            .take(inner.height as usize)
+            .cloned()
+            .collect();
+        let paragraph = Paragraph::new(visible);
+        f.render_widget(paragraph, inner);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
@@ -623,10 +1025,25 @@ pub struct App {
     agent_pane: TerminalPane,
     shell_pane: TerminalPane,
     scratchpad: ScratchpadPane,
+    explorer: FileExplorer,
+    show_explorer: bool,
+    file_viewer: Option<FileViewer>,
+    selection: Option<Selection>,
+    /// Which pane the active selection is in.
+    selection_target: Option<SelectionPane>,
+    copy_pending: bool,
     // Cached pane areas for mouse hit-testing.
     agent_area: Rect,
     shell_area: Rect,
     scratch_area: Rect,
+    explorer_area: Rect,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelectionPane {
+    Agent,
+    Shell,
+    Scratchpad,
 }
 
 /// Derive a stable scratchpad path from the current working directory.
@@ -695,9 +1112,16 @@ impl App {
             agent_pane: TerminalPane::spawn(agent.name, &program, &args, agent_rows, agent_cols, agent_env)?,
             shell_pane: TerminalPane::spawn_shell(shell_rows, shell_cols, shell_env)?,
             scratchpad,
+            explorer: FileExplorer::new()?,
+            show_explorer: false,
+            file_viewer: None,
+            selection: None,
+            selection_target: None,
+            copy_pending: false,
             agent_area: Rect::default(),
             shell_area: Rect::default(),
             scratch_area: Rect::default(),
+            explorer_area: Rect::default(),
         })
     }
 
@@ -755,6 +1179,18 @@ impl App {
                 }
                 if key.modifiers.contains(KeyModifiers::ALT) {
                     match key.code {
+                        KeyCode::Char('e') => {
+                            self.show_explorer = !self.show_explorer;
+                            if self.show_explorer {
+                                self.focus = Focus::Explorer;
+                            } else {
+                                self.file_viewer = None;
+                                if self.focus == Focus::Explorer {
+                                    self.focus = Focus::Agent;
+                                }
+                            }
+                            return false;
+                        }
                         KeyCode::Char('1') => {
                             self.focus = Focus::Agent;
                             return false;
@@ -772,11 +1208,45 @@ impl App {
                 }
                 if key.code == KeyCode::BackTab {
                     self.focus = self.focus.next();
+                    // Skip explorer in cycle if hidden.
+                    if self.focus == Focus::Explorer && !self.show_explorer {
+                        self.focus = self.focus.next();
+                    }
                     return false;
                 }
 
                 // --- Dispatch to focused pane ---
                 match self.focus {
+                    Focus::Explorer => {
+                        match key.code {
+                            KeyCode::Up => self.explorer.move_up(),
+                            KeyCode::Down => self.explorer.move_down(),
+                            KeyCode::Enter => {
+                                if self.explorer.selected_is_dir() {
+                                    self.explorer.toggle_dir();
+                                } else if let Some(path) = self.explorer.selected_path() {
+                                    self.file_viewer = FileViewer::open(path);
+                                }
+                            }
+                            KeyCode::Right => {
+                                if self.explorer.selected_is_dir() {
+                                    self.explorer.toggle_dir();
+                                }
+                            }
+                            KeyCode::Left => {
+                                if self.explorer.selected_is_dir() {
+                                    let entry = &self.explorer.entries[self.explorer.selected];
+                                    if entry.expanded {
+                                        self.explorer.toggle_dir();
+                                    }
+                                }
+                            }
+                            KeyCode::Esc => {
+                                self.file_viewer = None;
+                            }
+                            _ => {}
+                        }
+                    }
                     Focus::Agent => {
                         if !self.agent_pane.exited {
                             self.agent_pane.scroll_reset();
@@ -813,8 +1283,15 @@ impl App {
 
         // Determine which pane the mouse is in.
         #[allow(dead_code)]
-        enum Target { Agent, Shell, Scratchpad }
-        let target = if rect_contains(self.agent_area, col, row) {
+        enum Target { Explorer, Agent, Shell, Scratchpad }
+        let target = if self.show_explorer && rect_contains(self.explorer_area, col, row) {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.focus = Focus::Explorer;
+                self.selection = None;
+                self.selection_target = None;
+            }
+            Target::Explorer
+        } else if rect_contains(self.agent_area, col, row) {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.focus = Focus::Agent;
             }
@@ -825,66 +1302,118 @@ impl App {
             }
             Target::Shell
         } else if rect_contains(self.scratch_area, col, row) {
-            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 self.focus = Focus::Scratchpad;
             }
-            return;
+            // Handle scroll on file viewer.
+            if let Some(viewer) = &mut self.file_viewer {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => viewer.scroll_up(3),
+                    MouseEventKind::ScrollDown => viewer.scroll_down(3),
+                    _ => {}
+                }
+            }
+            Target::Scratchpad
         } else {
             return;
         };
 
-        let (pane, pane_area) = match target {
-            Target::Agent => (&mut self.agent_pane, self.agent_area),
-            Target::Shell => (&mut self.shell_pane, self.shell_area),
-            Target::Scratchpad => return,
+        let (sel_pane, pane_area) = match target {
+            Target::Agent => (SelectionPane::Agent, self.agent_area),
+            Target::Shell => (SelectionPane::Shell, self.shell_area),
+            Target::Scratchpad => (SelectionPane::Scratchpad, self.scratch_area),
+            Target::Explorer => return,
         };
-
-        if pane.exited {
-            return;
-        }
-
-        let (mode, encoding) = pane.mouse_mode();
-
-        // If the child hasn't enabled mouse tracking, handle scroll as
-        // Lattice-level scrollback (like tmux copy-mode).
-        if mode == vt100::MouseProtocolMode::None {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => pane.scroll_up(3),
-                MouseEventKind::ScrollDown => pane.scroll_down(3),
-                _ => {}
-            }
-            return;
-        }
 
         let inner = Block::default().borders(Borders::ALL).inner(pane_area);
-        let local_col = col.saturating_sub(inner.x) + 1;
-        let local_row = row.saturating_sub(inner.y) + 1;
 
-        // Filter events based on the child's declared mouse mode.
-        let allowed = match mouse.kind {
-            MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-            | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => true,
-            MouseEventKind::Up(_) => mode != vt100::MouseProtocolMode::Press,
-            MouseEventKind::Drag(_) => {
-                mode == vt100::MouseProtocolMode::ButtonMotion
-                    || mode == vt100::MouseProtocolMode::AnyMotion
+        // For terminal panes, check if the child has mouse tracking.
+        let is_terminal = matches!(sel_pane, SelectionPane::Agent | SelectionPane::Shell);
+        if is_terminal {
+            let pane = match sel_pane {
+                SelectionPane::Agent => &mut self.agent_pane,
+                SelectionPane::Shell => &mut self.shell_pane,
+                _ => unreachable!(),
+            };
+
+            if pane.exited {
+                return;
             }
-            MouseEventKind::Moved => mode == vt100::MouseProtocolMode::AnyMotion,
-        };
-        if !allowed {
-            return;
+
+            let (mode, encoding) = pane.mouse_mode();
+
+            if mode != vt100::MouseProtocolMode::None {
+                // Child has mouse tracking: forward events, clear any selection.
+                self.selection = None;
+                self.selection_target = None;
+
+                let local_col = col.saturating_sub(inner.x) + 1;
+                let local_row = row.saturating_sub(inner.y) + 1;
+
+                let allowed = match mouse.kind {
+                    MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => true,
+                    MouseEventKind::Up(_) => mode != vt100::MouseProtocolMode::Press,
+                    MouseEventKind::Drag(_) => {
+                        mode == vt100::MouseProtocolMode::ButtonMotion
+                            || mode == vt100::MouseProtocolMode::AnyMotion
+                    }
+                    MouseEventKind::Moved => mode == vt100::MouseProtocolMode::AnyMotion,
+                };
+                if !allowed {
+                    return;
+                }
+
+                let seq = match encoding {
+                    vt100::MouseProtocolEncoding::Sgr => {
+                        mouse_event_to_sgr(&mouse, local_col, local_row)
+                    }
+                    _ => {
+                        mouse_event_to_x10(&mouse, local_col, local_row)
+                    }
+                };
+                if let Some(bytes) = seq {
+                    let _ = pane.input_tx.send(Bytes::from(bytes)).await;
+                }
+                return;
+            }
+
+            // No mouse tracking: handle scroll.
+            match mouse.kind {
+                MouseEventKind::ScrollUp => { pane.scroll_up(3); return; }
+                MouseEventKind::ScrollDown => { pane.scroll_down(3); return; }
+                _ => {}
+            }
         }
 
-        let seq = match encoding {
-            vt100::MouseProtocolEncoding::Sgr => {
-                mouse_event_to_sgr(&mouse, local_col, local_row)
+        // --- Pane-local text selection (works for all pane types) ---
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let local_col = col.saturating_sub(inner.x);
+                let local_row = row.saturating_sub(inner.y);
+                let anchor = SelectionAnchor { row: local_row, col: local_col };
+                self.selection = Some(Selection {
+                    pane_area: inner,
+                    start: anchor,
+                    end: anchor,
+                });
+                self.selection_target = Some(sel_pane);
             }
-            _ => {
-                mouse_event_to_x10(&mouse, local_col, local_row)
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(sel) = &mut self.selection {
+                    if self.selection_target == Some(sel_pane) {
+                        let local_col = col.saturating_sub(inner.x).min(inner.width.saturating_sub(1));
+                        let local_row = row.saturating_sub(inner.y).min(inner.height.saturating_sub(1));
+                        sel.end = SelectionAnchor { row: local_row, col: local_col };
+                    }
+                }
             }
-        };
-        if let Some(bytes) = seq {
-            let _ = pane.input_tx.send(Bytes::from(bytes)).await;
+            MouseEventKind::Up(MouseButton::Left) => {
+                // Mark copy as pending — actual extraction happens in render()
+                // when we have access to the buffer.
+                self.copy_pending = true;
+            }
+            _ => {}
         }
     }
 
@@ -894,12 +1423,22 @@ impl App {
         let [main_area, status_area] =
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
 
-        // Three-pane: agent (left 50%) | right (50%).
+        // Optional explorer on the left.
+        let (explorer_area, content_area) = if self.show_explorer {
+            let [ea, ca] =
+                Layout::horizontal([Constraint::Length(30), Constraint::Min(0)])
+                    .areas(main_area);
+            (Some(ea), ca)
+        } else {
+            (None, main_area)
+        };
+
+        // Main content: agent (left 50%) | right (50%).
         let [agent_area, right_area] =
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(main_area);
+                .areas(content_area);
 
-        // Right: scratchpad (top 40%) | terminal (bottom 60%).
+        // Right: scratchpad/viewer (top 70%) | terminal (bottom 30%).
         let [scratch_area, term_area] =
             Layout::vertical([Constraint::Percentage(70), Constraint::Percentage(30)])
                 .areas(right_area);
@@ -908,6 +1447,7 @@ impl App {
         self.agent_area = agent_area;
         self.scratch_area = scratch_area;
         self.shell_area = term_area;
+        self.explorer_area = explorer_area.unwrap_or_default();
 
         // Resize PTYs if inner dimensions changed.
         let agent_inner = Block::default().borders(Borders::ALL).inner(agent_area);
@@ -916,17 +1456,82 @@ impl App {
         let term_inner = Block::default().borders(Borders::ALL).inner(term_area);
         self.shell_pane.resize(term_inner.height, term_inner.width);
 
+        // Render explorer if visible.
+        if let Some(ea) = explorer_area {
+            self.explorer.render(f, ea, self.focus == Focus::Explorer);
+        }
+
         // Render panes.
         self.agent_pane
-            .render(f, agent_area, self.focus == Focus::Agent);
-        self.scratchpad
-            .render(f, scratch_area, self.focus == Focus::Scratchpad);
+            .render(f, agent_area, self.focus == Focus::Agent, None);
+
+        // Show file viewer or scratchpad in the top-right area.
+        if let Some(viewer) = &self.file_viewer {
+            viewer.render(f, scratch_area);
+        } else {
+            self.scratchpad
+                .render(f, scratch_area, self.focus == Focus::Scratchpad);
+        }
+
         self.shell_pane
-            .render(f, term_area, self.focus == Focus::Terminal);
+            .render(f, term_area, self.focus == Focus::Terminal, None);
+
+        // Paint selection highlight on whichever pane has it.
+        if let Some(sel) = &self.selection {
+            let sel_area = sel.pane_area;
+            let buf = f.buffer_mut();
+            for row in 0..sel_area.height {
+                for col_idx in 0..sel_area.width {
+                    if sel.contains(row, col_idx) {
+                        let x = sel_area.x + col_idx;
+                        let y = sel_area.y + row;
+                        if let Some(cell) = buf.cell_mut((x, y)) {
+                            cell.set_style(
+                                Style::default()
+                                    .bg(Color::LightBlue)
+                                    .fg(Color::Black),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Extract and copy text from the buffer on mouse-up.
+            if self.copy_pending {
+                let (s, e) = sel.ordered();
+                let mut text = String::new();
+                for row in s.row..=e.row {
+                    let col_start = if row == s.row { s.col } else { 0 };
+                    let col_end = if row == e.row {
+                        e.col
+                    } else {
+                        sel_area.width.saturating_sub(1)
+                    };
+                    for c in col_start..=col_end {
+                        let x = sel_area.x + c;
+                        let y = sel_area.y + row;
+                        if let Some(cell) = buf.cell((x, y)) {
+                            let sym = cell.symbol();
+                            text.push_str(sym);
+                        }
+                    }
+                    if row < e.row {
+                        let trimmed = text.trim_end().len();
+                        text.truncate(trimmed);
+                        text.push('\n');
+                    }
+                }
+                let text = text.trim_end().to_string();
+                if !text.is_empty() && s != e {
+                    osc52_copy(&text);
+                }
+            }
+        }
+        self.copy_pending = false;
 
         // Status bar.
         let status_text = format!(
-            " Alt+1: Agent | Alt+2: Terminal | Alt+3: Scratchpad | Shift+Tab: Cycle | Ctrl+Q: Quit  [{}]",
+            " Alt+E: Explorer | Alt+1: Agent | Alt+2: Terminal | Alt+3: Scratchpad | Ctrl+Q: Quit  [{}]",
             self.focus.label()
         );
         let status = Paragraph::new(status_text)
